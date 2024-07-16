@@ -1,0 +1,258 @@
+"""
+Database Embedding Script
+
+This script reads code examples from a text file, generates embeddings using OpenAI's API,
+and stores the data in a PostgreSQL database. It handles multiple entries per file and
+can be run with different input files over time to add new entries to the database.
+
+Usage:
+    python app.py [input_file]
+
+If no input file is specified, it defaults to 'input.txt'.
+
+Environment variables required:
+    - OPENAI_API_KEY: Your OpenAI API key
+    - DB_NAME: Database name
+    - DB_USER: Database user
+    - DB_PASSWORD: Database password
+    - DB_HOST: Database host
+    - DB_PORT: Database port
+
+The input file should be formatted as follows:
+    Pseudo code for first entry
+    ---
+    Code for first entry
+    ===
+    Code type for first entry
+    ---
+    Pseudo code for second entry
+    ---
+    Code for second entry
+    ===
+    Code type for second entry
+    ...
+"""
+
+import os
+import sys
+import psycopg2
+from psycopg2.extras import execute_values
+import openai
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Set up OpenAI API key
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Database connection parameters
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = os.getenv("DB_PORT")
+
+def read_input_file(file_path):
+    """
+    Read and parse the input file containing code examples.
+
+    Args:
+        file_path (str): Path to the input file.
+
+    Returns:
+        list: A list of tuples, each containing (pseudo_code, code, code_type).
+
+    Raises:
+        FileNotFoundError: If the specified file is not found.
+        Exception: For any other error during file reading.
+    """
+    try:
+        with open(file_path, 'r') as file:
+            content = file.read().split('---')
+        entries = []
+        for i in range(0, len(content), 2):
+            if i+1 < len(content):
+                pseudo_code = content[i].strip()
+                code_and_type = content[i+1].strip().split('===')
+                code = code_and_type[0].strip()
+                code_type = code_and_type[1].strip() if len(code_and_type) > 1 else "unknown"
+                entries.append((pseudo_code, code, code_type))
+        return entries
+    except FileNotFoundError:
+        print(f"Error: File '{file_path}' not found.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error reading file: {str(e)}")
+        sys.exit(1)
+
+def generate_embedding(text):
+    """
+    Generate an embedding for the given text using OpenAI's API.
+
+    Args:
+        text (str): The text to generate an embedding for.
+
+    Returns:
+        list: The generated embedding as a list of floats, or None if an error occurs.
+    """
+    try:
+        response = openai.Embedding.create(
+            input=text,
+            model="text-embedding-ada-002"
+        )
+        return response['data'][0]['embedding']
+    except openai.error.OpenAIError as e:
+        print(f"OpenAI API error: {str(e)}")
+        return None
+
+def create_tables(conn):
+    """
+    Create the necessary tables in the database if they don't exist.
+
+    Args:
+        conn (psycopg2.extensions.connection): Database connection object.
+
+    Raises:
+        psycopg2.Error: If a database error occurs.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS code (
+                id BIGINT NOT NULL DEFAULT nextval('code_id_seq'::regclass),
+                code TEXT,
+                CONSTRAINT code_pkey PRIMARY KEY (id)
+            )
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS pseudo_code (
+                id BIGINT NOT NULL DEFAULT nextval('pseudo_code_id_seq'::regclass),
+                pseudo_code TEXT,
+                embedding vector(1536),
+                code_id BIGINT NOT NULL,
+                code_type TEXT,
+                CONSTRAINT pseudo_code_pkey PRIMARY KEY (id),
+                CONSTRAINT pseudo_code_code_id_fkey FOREIGN KEY (code_id) REFERENCES code(id)
+            )
+            """)
+        conn.commit()
+    except psycopg2.Error as e:
+        print(f"Database error: {str(e)}")
+        conn.rollback()
+        sys.exit(1)
+
+def insert_data(conn, pseudo_code, embedding, code, code_type):
+    """
+    Insert a new entry into the database.
+
+    Args:
+        conn (psycopg2.extensions.connection): Database connection object.
+        pseudo_code (str): The pseudo-code description.
+        embedding (list): The generated embedding.
+        code (str): The actual code.
+        code_type (str): The type of the code.
+
+    Raises:
+        psycopg2.Error: If a database error occurs.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO code (code)
+            VALUES (%s)
+            RETURNING id
+            """, (code,))
+            code_id = cur.fetchone()[0]
+            
+            cur.execute("""
+            INSERT INTO pseudo_code (pseudo_code, embedding, code_id, code_type)
+            VALUES (%s, %s, %s, %s)
+            """, (pseudo_code, embedding, code_id, code_type))
+        conn.commit()
+    except psycopg2.Error as e:
+        print(f"Database error: {str(e)}")
+        conn.rollback()
+
+def display_table_contents(conn):
+    """
+    Display the contents of both tables in the database.
+
+    Args:
+        conn (psycopg2.extensions.connection): Database connection object.
+
+    Raises:
+        psycopg2.Error: If a database error occurs.
+    """
+    try:
+        with conn.cursor() as cur:
+            print("\n=== Code Table ===")
+            cur.execute("SELECT * FROM code")
+            code_rows = cur.fetchall()
+            for row in code_rows:
+                print(f"ID: {row[0]}")
+                print(f"Code:\n{row[1]}\n")
+
+            print("\n=== Pseudo Code Table ===")
+            cur.execute("SELECT * FROM pseudo_code")
+            pseudo_code_rows = cur.fetchall()
+            for row in pseudo_code_rows:
+                print(f"ID: {row[0]}")
+                print(f"Pseudo Code: {row[1]}")
+                print(f"Embedding: {row[2][:5]}... (truncated)")
+                print(f"Code ID: {row[3]}")
+                print(f"Code Type: {row[4]}\n")
+    except psycopg2.Error as e:
+        print(f"Database error: {str(e)}")
+
+def main(input_file='input.txt'):
+    """
+    Main function to process the input file and update the database.
+
+    Args:
+        input_file (str): Path to the input file. Defaults to 'input.txt'.
+    """
+    try:
+        # Read input file
+        entries = read_input_file(input_file)
+
+        # Connect to the database
+        conn = psycopg2.connect(
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT
+        )
+
+        # Create tables if they don't exist
+        create_tables(conn)
+
+        # Process each entry
+        for pseudo_code, code, code_type in entries:
+            # Generate embedding
+            embedding = generate_embedding(pseudo_code)
+            if embedding is None:
+                print(f"Skipping entry due to embedding generation failure: {pseudo_code[:50]}...")
+                continue
+
+            # Insert data into the database
+            insert_data(conn, pseudo_code, embedding, code, code_type)
+
+        # Display table contents
+        display_table_contents(conn)
+
+    except psycopg2.Error as e:
+        print(f"Database connection error: {str(e)}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"An unexpected error occurred: {str(e)}")
+        sys.exit(1)
+    finally:
+        # Close the connection
+        if 'conn' in locals() and conn is not None:
+            conn.close()
+
+if __name__ == "__main__":
+    input_file = sys.argv[1] if len(sys.argv) > 1 else 'input.txt'
+    main(input_file)
